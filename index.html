@@ -1,9 +1,14 @@
 <!DOCTYPE html>
+<!-- v2.0 - 2026-06-02 - Fix iPhone crash on review list (lazy-render + scroll auto + no-cache) -->
 <html lang="es">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="theme-color" content="#f7faf8">
+<!-- Anti-caché: el HTML siempre se pide fresco al servidor para que las actualizaciones lleguen al instante. -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>OPE Enfermería OSAKIDETZA</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -6266,10 +6271,32 @@ function checkStreakReset() {
 // ═══════════════════════════════════════════════════════════════
 // BANCOS / REVIEW
 // ═══════════════════════════════════════════════════════════════
+// v2.0: Lazy-render con IntersectionObserver
+//   Antes: pintaba las 500 cards de golpe → crashes por memoria en iPhone.
+//   Ahora: pinta INITIAL_BATCH al inicio y va añadiendo CHUNK más
+//   cuando el usuario hace scroll cerca del final.
+//   Si hay un resumeIdx (botón "Continuar #101"), se asegura de pintar
+//   hasta esa posición + un margen, para que jumpToReviewQuestion lo encuentre.
+const REVIEW_INITIAL_BATCH = 40;   // cards pintadas al entrar en la vista
+const REVIEW_CHUNK = 30;           // cards añadidas en cada scroll
+const REVIEW_PREFETCH_MARGIN = 10; // cards extra después del resumeIdx
+
+let _reviewVisibleIdxs = [];       // índices ordenados de las que pasan filtros
+let _reviewRenderedCount = 0;      // cuántas hemos pintado ya
+let _reviewObserver = null;        // IntersectionObserver del centinela
+
 function renderReview() {
     updateReviewStats();
     const container = document.getElementById('review-questions');
     container.innerHTML = '';
+
+    // Limpiar observer anterior si existe (cambio de filtro/banco)
+    if (_reviewObserver) {
+        _reviewObserver.disconnect();
+        _reviewObserver = null;
+    }
+    _reviewVisibleIdxs = [];
+    _reviewRenderedCount = 0;
 
     // Resume helper: show a "Continue where you left off" button at the top
     // if there is a manual bookmark for this bank.
@@ -6280,30 +6307,19 @@ function renderReview() {
         resumeNum = BANK_LOCAL_NUM[resumeIdx] || (resumeIdx + 1);
     }
 
-    let shown = 0;
-    const visibleIdxs = [];
+    // 1) Calcular qué índices son visibles (sin pintarlos todavía)
     QUESTIONS.forEach((q, i) => {
         const s = state.answers[i] || {};
         if (!shouldShowQuestion(i, s)) return;
-        const card = document.createElement('div');
-        card.className = 'question-card';
-        card.id = 'review-q-' + i;
-        if (q.nula) card.classList.add('nula-card');
-        if (s.answered && !q.nula) card.classList.add(s.correct ? 'answered-correct' : 'answered-wrong');
-        if (s.saved) card.classList.add('saved-later');
-        if (s.doubt) card.classList.add('marked-doubt');
-        card.innerHTML = buildQuestionHTML(q, i, s, 'review');
-        container.appendChild(card);
-        visibleIdxs.push(i);
-        shown++;
+        _reviewVisibleIdxs.push(i);
     });
 
-    // Show resume button if there is a saved position AND it appears in the
-    // current visible list (filtering may hide it, in which case the button
-    // would lead nowhere)
+    const total = _reviewVisibleIdxs.length;
+
+    // Mostrar resume button si la pregunta marcada está en la lista visible
     const oldBtn = document.getElementById('resume-btn');
     if (oldBtn) oldBtn.remove();
-    if (resumeNum != null && visibleIdxs.includes(resumeIdx)) {
+    if (resumeNum != null && _reviewVisibleIdxs.includes(resumeIdx)) {
         const btn = document.createElement('button');
         btn.id = 'resume-btn';
         btn.className = 'btn-resume';
@@ -6312,15 +6328,114 @@ function renderReview() {
         container.parentNode.insertBefore(btn, container);
     }
 
-    if (shown === 0) {
+    if (total === 0) {
         container.innerHTML = '<div class="card" style="text-align:center; padding:40px 20px; color:var(--text-muted);">No hay preguntas que coincidan con el filtro</div>';
+        return;
+    }
+
+    // 2) Calcular cuántas cards pintar inicialmente.
+    //    Si hay resumeIdx visible, asegurar pintar hasta esa posición + margen.
+    let initialCount = REVIEW_INITIAL_BATCH;
+    if (resumeNum != null && _reviewVisibleIdxs.includes(resumeIdx)) {
+        const resumePos = _reviewVisibleIdxs.indexOf(resumeIdx);
+        initialCount = Math.max(initialCount, resumePos + 1 + REVIEW_PREFETCH_MARGIN);
+    }
+    initialCount = Math.min(initialCount, total);
+
+    // 3) Pintar el primer lote
+    appendReviewBatch(container, 0, initialCount);
+
+    // 4) Si quedan más, instalar centinela + observer para lazy-load
+    if (_reviewRenderedCount < total) {
+        installReviewSentinel(container);
     }
 }
 
+function appendReviewBatch(container, fromIdx, toIdx) {
+    // Pinta las cards [fromIdx, toIdx) del array _reviewVisibleIdxs.
+    // Usa DocumentFragment para minimizar reflows en el DOM.
+    const frag = document.createDocumentFragment();
+    for (let pos = fromIdx; pos < toIdx; pos++) {
+        const i = _reviewVisibleIdxs[pos];
+        const q = QUESTIONS[i];
+        const s = state.answers[i] || {};
+        const card = document.createElement('div');
+        card.className = 'question-card';
+        card.id = 'review-q-' + i;
+        if (q.nula) card.classList.add('nula-card');
+        if (s.answered && !q.nula) card.classList.add(s.correct ? 'answered-correct' : 'answered-wrong');
+        if (s.saved) card.classList.add('saved-later');
+        if (s.doubt) card.classList.add('marked-doubt');
+        card.innerHTML = buildQuestionHTML(q, i, s, 'review');
+        frag.appendChild(card);
+    }
+    container.appendChild(frag);
+    _reviewRenderedCount = toIdx;
+}
+
+function installReviewSentinel(container) {
+    // Crea (o reutiliza) un nodo "centinela" al final del container.
+    // Cuando entra en viewport, pintamos el siguiente chunk.
+    let sentinel = document.getElementById('review-sentinel');
+    if (!sentinel) {
+        sentinel = document.createElement('div');
+        sentinel.id = 'review-sentinel';
+        sentinel.style.height = '1px';
+        sentinel.style.width = '100%';
+    }
+    container.appendChild(sentinel);
+
+    _reviewObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            const total = _reviewVisibleIdxs.length;
+            if (_reviewRenderedCount >= total) {
+                _reviewObserver.disconnect();
+                _reviewObserver = null;
+                sentinel.remove();
+                return;
+            }
+            const next = Math.min(_reviewRenderedCount + REVIEW_CHUNK, total);
+            // Pintar antes del centinela para que se mantenga al final
+            const frag = document.createDocumentFragment();
+            for (let pos = _reviewRenderedCount; pos < next; pos++) {
+                const i = _reviewVisibleIdxs[pos];
+                const q = QUESTIONS[i];
+                const s = state.answers[i] || {};
+                const card = document.createElement('div');
+                card.className = 'question-card';
+                card.id = 'review-q-' + i;
+                if (q.nula) card.classList.add('nula-card');
+                if (s.answered && !q.nula) card.classList.add(s.correct ? 'answered-correct' : 'answered-wrong');
+                if (s.saved) card.classList.add('saved-later');
+                if (s.doubt) card.classList.add('marked-doubt');
+                card.innerHTML = buildQuestionHTML(q, i, s, 'review');
+                frag.appendChild(card);
+            }
+            container.insertBefore(frag, sentinel);
+            _reviewRenderedCount = next;
+
+            if (_reviewRenderedCount >= total) {
+                _reviewObserver.disconnect();
+                _reviewObserver = null;
+                sentinel.remove();
+            }
+        }
+    }, {
+        // Empezar a cargar el siguiente chunk antes de que el centinela
+        // sea visible, para que el scroll sea fluido.
+        rootMargin: '600px 0px',
+        threshold: 0
+    });
+    _reviewObserver.observe(sentinel);
+}
+
 function jumpToReviewQuestion(idx) {
+    // v2.0: en iPhone con muchas cards, smooth scroll causa crashes por memoria.
+    // Usamos 'auto' (scroll instantáneo) que es mucho más ligero.
     const card = document.getElementById('review-q-' + idx);
     if (!card) return;
-    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    card.scrollIntoView({ behavior: 'auto', block: 'start' });
     // Brief highlight so the user spots where they were
     card.style.transition = 'box-shadow 0.6s ease';
     card.style.boxShadow = '0 0 0 4px var(--accent-soft)';
