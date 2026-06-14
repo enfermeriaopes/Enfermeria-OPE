@@ -6662,18 +6662,48 @@ function answerReview(idx, letter) {
     updateReviewStats();
 }
 
+function updateReviewCard(idx) {
+    // Refresca SOLO la tarjeta indicada, sin tocar el resto de la lista ni el
+    // scroll/lazy-render. Replica la lógica de clases de appendReviewBatch.
+    const card = document.getElementById('review-q-' + idx);
+    if (!card) return;
+    const q = QUESTIONS[idx];
+    const s = state.answers[idx] || {};
+    card.className = 'question-card';
+    if (q.nula) card.classList.add('nula-card');
+    if (s.answered && !q.nula) card.classList.add(s.correct ? 'answered-correct' : 'answered-wrong');
+    if (s.saved) card.classList.add('saved-later');
+    if (s.doubt) card.classList.add('marked-doubt');
+    card.innerHTML = buildQuestionHTML(q, idx, s, 'review');
+}
+
 function toggleSave(idx) {
     if (!state.answers[idx]) state.answers[idx] = {};
     state.answers[idx].saved = !state.answers[idx].saved;
     saveState();
-    renderReview();
+    // Solo re-renderizamos toda la lista si el filtro/banco activo depende de
+    // "guardadas" (al desmarcar, la pregunta debe desaparecer). En cualquier
+    // otro caso actualizamos solo esta tarjeta para no resetear el scroll.
+    if (currentBank === 'saved' || currentFilter === 'saved') {
+        renderReview();
+    } else {
+        updateReviewCard(idx);
+        updateReviewStats();
+    }
 }
 
 function toggleDoubt(idx) {
     if (!state.answers[idx]) state.answers[idx] = {};
     state.answers[idx].doubt = !state.answers[idx].doubt;
     saveState();
-    renderReview();
+    // Igual que toggleSave: re-render completo solo si el filtro depende de
+    // "para repasar"; si no, refrescamos únicamente esta tarjeta.
+    if (currentBank === 'doubt' || currentFilter === 'doubt') {
+        renderReview();
+    } else {
+        updateReviewCard(idx);
+        updateReviewStats();
+    }
 }
 
 function resetQuestion(idx) {
